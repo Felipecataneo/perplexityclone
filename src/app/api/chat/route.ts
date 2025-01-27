@@ -1,84 +1,119 @@
 import { NextResponse } from 'next/server';
+import Groq from 'groq-sdk';
 
-const OLLAMA_API_URL = 'http://localhost:11434/api/chat'; // URL local do Ollama
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
 
-// Set response timeout to 30 seconds
-export const maxDuration = 30;
+if (!process.env.GROQ_API_KEY) {
+  throw new Error('GROQ_API_KEY is not set in environment variables');
+}
 
-// Configure the runtime to use edge for better streaming support
 export const runtime = 'edge';
 export const dynamic = 'force-dynamic';
+
+// Função auxiliar para criar delays naturais
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Função para dividir texto em chunks naturais
+function splitIntoNaturalChunks(text: string): string[] {
+  // Divide o texto em sentenças ou parágrafos
+  const sentences = text.match(/[^.!?]+[.!?]+|\n+/g) || [];
+  const chunks: string[] = [];
+  let currentChunk = '';
+
+  for (const sentence of sentences) {
+    if (currentChunk.length + sentence.length > 100) {
+      if (currentChunk) chunks.push(currentChunk.trim());
+      currentChunk = sentence;
+    } else {
+      currentChunk += sentence;
+    }
+  }
+  
+  if (currentChunk) chunks.push(currentChunk.trim());
+  return chunks;
+}
 
 export async function POST(req: Request) {
   try {
     const { messages } = await req.json();
 
-    const response = await fetch(OLLAMA_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'deepseek-r1:8b', // Nome do modelo no Ollama
-        messages,
-        stream: true,
-        max_tokens: 4000,
-        temperature: 0.7,
-      }),
+    const chatCompletion = await groq.chat.completions.create({
+      model: 'deepseek-r1-distill-llama-70b',
+      messages,
+      max_tokens: 4000,
+      temperature: 0.7,
     });
 
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to get response from Ollama');
+    if (!chatCompletion || !chatCompletion.choices) {
+      throw new Error('No valid response from Groq');
     }
 
-    if (!response.body) {
-      throw new Error('No response body available');
-    }
-
-    const reader = response.body.getReader();
+    const responseContent = chatCompletion.choices[0]?.message?.content || '';
     const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
+
+    // Separar o conteúdo em "thinking" e "response"
+    const thinkMatch = responseContent.match(/<think>([\s\S]*?)<\/think>/);
+    const thinking = thinkMatch ? thinkMatch[1].trim() : '';
+    const response = responseContent.replace(/<think>[\s\S]*?<\/think>/, '').trim();
 
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          while (true) {
-            const { done, value } = await reader.read();
+          // Processar o thinking primeiro
+          if (thinking) {
+            const thinkingChunks = splitIntoNaturalChunks(thinking);
+            for (const chunk of thinkingChunks) {
+              // Simular velocidade de digitação variável
+              const typingDelay = Math.random() * 30 + 20; // 20-50ms por chunk
+              await delay(typingDelay);
 
-            if (done) {
-              controller.close();
-              break;
+              const thinkingResponse = {
+                choices: [{
+                  delta: {
+                    reasoning_content: chunk
+                  }
+                }]
+              };
+              controller.enqueue(encoder.encode(JSON.stringify(thinkingResponse) + '\n'));
             }
 
-            const text = decoder.decode(value);
-            const lines = text.split('\n');
+            // Pequena pausa entre thinking e resposta
+            await delay(500);
+          }
 
-            for (const line of lines) {
-              if (line.trim() === '') continue;
-              if (line.trim() === 'data: [DONE]') continue;
+          // Processar a resposta principal
+          const responseChunks = splitIntoNaturalChunks(response);
+          for (const chunk of responseChunks) {
+            // Simular velocidade de digitação natural
+            const words = chunk.split(' ').length;
+            const typingDelay = (Math.random() * 20 + 10) * words; // Delay baseado no número de palavras
+            await delay(typingDelay);
 
-              let data = line;
-              if (line.startsWith('data: ')) {
-                data = line.slice(6);
-              }
+            const contentResponse = {
+              choices: [{
+                delta: {
+                  content: chunk
+                }
+              }]
+            };
+            controller.enqueue(encoder.encode(JSON.stringify(contentResponse) + '\n'));
 
-              try {
-                const parsed = JSON.parse(data);
-                controller.enqueue(encoder.encode(JSON.stringify(parsed) + '\n'));
-              } catch (e) {
-                console.error('Error parsing JSON:', e);
-              }
+            // Adicionar pequenas pausas em pontuações
+            if (chunk.match(/[.!?]\s*$/)) {
+              await delay(200); // Pausa maior no fim das sentenças
             }
           }
-        } catch (e) {
-          controller.error(e);
-        }
-      },
 
-      cancel() {
-        reader.cancel();
-      },
+          // Sinalizar o fim do stream
+          controller.enqueue(encoder.encode(JSON.stringify({ choices: [{ delta: { content: '' } }] }) + '\n'));
+          controller.close();
+        } catch (error) {
+          console.error('Streaming error:', error);
+          controller.error(error);
+        }
+      }
     });
 
     return new Response(stream, {
